@@ -1,4 +1,4 @@
-# liq_alerts_fast.py
+# liq_alerts_debug_raw.py
 import time, random, hashlib, requests
 from datetime import datetime, timedelta, timezone
 
@@ -20,10 +20,7 @@ MAX_RETRIES = 7
 INITIAL_COOLDOWN = 1.0
 SEND_NO_HITS_SUMMARY = True
 
-# Manual overrides: CoinGecko symbol → list of Coinalyze perps
 OVERRIDES = {}
-
-# Explicit mapping to avoid symbol collisions
 BASE_TO_CGID = {
     "btc": "bitcoin", "eth": "ethereum", "sol": "solana", "xrp": "ripple",
     "bnb": "binancecoin", "ada": "cardano", "doge": "dogecoin",
@@ -43,7 +40,7 @@ CG_RANGE   = "https://api.coingecko.com/api/v3/coins/{id}/market_chart/range"
 
 # -------- HTTP helpers --------
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "liq-alerts/fast"})
+SESSION.headers.update({"User-Agent": "liq-alerts/debug-raw"})
 
 def _sleep_jitter(base): time.sleep(base + random.random() * 0.25)
 
@@ -88,6 +85,7 @@ def last_completed_hour_window():
     return int(start.timestamp()), int(end.timestamp())
 
 def idem_key(*parts) -> str:
+    import hashlib
     m = hashlib.sha256()
     for p in parts: m.update(str(p).encode())
     return m.hexdigest()[:16]
@@ -152,6 +150,7 @@ def liq_last_hour_by_base(base_to_symbols):
     all_syms=sorted({s for syms in base_to_symbols.values() for s in syms})
     symbol_to_base={s:b for b,syms in base_to_symbols.items() for s in syms}
     totals={b:0.0 for b in base_to_symbols}
+    raw_by_base={}
 
     for i in range(0,len(all_syms),20):
         chunk=all_syms[i:i+20]
@@ -162,13 +161,15 @@ def liq_last_hour_by_base(base_to_symbols):
             b=symbol_to_base.get(entry.get("symbol"))
             if not b: continue
             hist=entry.get("history",[])
-            for c in reversed(hist):
-                t=int(c.get("t",0))
-                if frm<=t<=to:
-                    totals[b]+=float(c.get("l",0))+float(c.get("s",0))
-                    break
+            if hist:
+                raw_by_base.setdefault(b,[]).extend(hist)
+                for c in reversed(hist):
+                    t=int(c.get("t",0))
+                    if frm<=t<=to:
+                        totals[b]+=float(c.get("l",0))+float(c.get("s",0))
+                        break
         _sleep_jitter(PACE_SECONDS)
-    return totals,frm,to
+    return totals,raw_by_base,frm,to
 
 # -------- Main --------
 _seen_alerts=set()
@@ -187,9 +188,10 @@ def run_once():
         if syms: base_to_symbols[base]=syms
         else: unmatched.append(f"{base.upper()} ({coin['name']}) — no perps")
 
-    liq_by_base,frm,to=liq_last_hour_by_base(base_to_symbols)
+    liq_by_base,raw_by_base,frm,to=liq_last_hour_by_base(base_to_symbols)
     checked=0; alerted=0
 
+    print(f"[INFO] Window {frm}->{to} ({datetime.utcfromtimestamp(frm)} – {datetime.utcfromtimestamp(to)} UTC)")
     for coin in coins:
         base=coin["symbol"]; syms=base_to_symbols.get(base)
         if not syms: continue
@@ -197,7 +199,6 @@ def run_once():
         if liq_usd<MIN_LIQ_USD: continue
         checked+=1
 
-        # quick ratio pre-filter
         est_ratio=liq_usd/max(coin["market_cap"],1)
         if est_ratio<(RATIO_THRESHOLD*0.6): continue
 
@@ -205,6 +206,16 @@ def run_once():
         mc_close=get_market_cap_at_close(cg_id,to)
         if mc_close<=0 or not(LOWER_CAP<=mc_close<=UPPER_CAP): continue
         ratio=liq_usd/mc_close
+
+        # --- DEBUG PRINTS ---
+        print(f"[DEBUG] {base.upper()} | liq_usd={liq_usd:.2f} | mc_close={mc_close:.2f} | ratio={ratio:.5%} | syms={syms}")
+        # Show last 3 raw history points
+        raw = raw_by_base.get(base, [])[-3:]
+        for c in raw:
+            t=datetime.utcfromtimestamp(int(c['t']))
+            l=float(c.get('l',0)); s=float(c.get('s',0))
+            print(f"    [RAW] {base.upper()} {t} UTC | long={l} short={s}")
+
         if ratio>=RATIO_THRESHOLD:
             key=idem_key(sorted(syms),frm,to,round(ratio,6))
             if key in _seen_alerts: continue
@@ -220,6 +231,7 @@ def run_once():
             send_tg(msg); alerted+=1
 
     if unmatched:
+        print(f"[INFO] Unmatched bases: {len(unmatched)}")
         send_tg("⚠️ No perps:\n"+"\n".join(unmatched[:25]))
     if SEND_NO_HITS_SUMMARY and alerted==0:
         send_tg(f"ℹ️ Scan done: checked {checked}; no Liq/MC ≥ {RATIO_THRESHOLD*100:.3f}%")
