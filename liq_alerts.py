@@ -1,11 +1,11 @@
 import time, requests
 from datetime import datetime, timedelta, timezone
 
-# ====== YOUR TELEGRAM + COINALYZE DETAILS (filled in) ======
+# ====== YOUR TELEGRAM + COINALYZE DETAILS ======
 CHAT_IDS = ["-4869615280"]  # Telegram group
 COINALYZE_KEY = "30d603dd-9814-421e-94cc-62f9775c541c"
 TELEGRAM_TOKEN = "8422686073:AAGmMzABWh9r8cyXrdpoWYldThb51AaK0Aw"
-# ===========================================================
+# ===============================================
 
 # Settings
 LOWER_CAP = 50_000_000        # $50M
@@ -15,9 +15,10 @@ MIN_LIQ_USD = 0
 PACE_SECONDS = 1.7            # ~35 calls/min for Coinalyze
 SEND_NO_HITS_SUMMARY = True
 
-# CoinGecko rate-limiting
-COINGECKO_PACE_SECONDS = 1.5  # wait between CG requests
-MAX_RETRIES = 5
+# CoinGecko rate-limit handling
+COINGECKO_PACE_SECONDS = 1.8  # pause between CG pages
+MAX_RETRIES = 7               # total attempts per request
+INITIAL_COOLDOWN = 3.0        # pause before first CG request of the run
 
 # Manual overrides: CoinGecko symbol (lowercase) → Coinalyze aggregated perp symbol
 OVERRIDES = {
@@ -53,11 +54,39 @@ def coinalyze_get(path, params):
     r.raise_for_status()
     return r.json()
 
+# ---------- Robust CoinGecko GET with backoff ----------
+def http_get_with_backoff(url, params=None, timeout=40):
+    headers = {"User-Agent": "liq-alerts/1.0 (+github.com/yourrepo)"}
+    wait = 0.0
+    for attempt in range(1, MAX_RETRIES + 1):
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=timeout)
+            # 429: Too Many Requests -> backoff and retry
+            if r.status_code == 429:
+                ra = r.headers.get("Retry-After")
+                # If server suggests a wait, use it; else exponential backoff
+                wait = float(ra) if (ra and ra.isdigit()) else min(2 * attempt, 30)
+                continue
+            # 5xx: transient -> backoff and retry
+            if 500 <= r.status_code < 600:
+                wait = min(2 * attempt, 30)
+                continue
+            r.raise_for_status()
+            return r
+        except requests.RequestException:
+            # network/dns/timeout etc -> backoff and retry
+            wait = min(2 * attempt, 30)
+            continue
+    # If we exhausted retries, raise a friendly error
+    raise RuntimeError("CoinGecko request repeatedly rate-limited or failed; try again shortly.")
+
 def get_future_markets():
     data = coinalyze_get("/future-markets", {})
     out = []
     for m in data:
-        sym = m.get("symbol","")
+        sym = m.get("symbol", "")
         base = (m.get("base_asset") or "").lower()
         if "_PERP" in sym and sym.endswith(".A"):
             out.append({"symbol": sym, "base": base})
@@ -70,30 +99,12 @@ def map_base_to_agg_symbol(future_markets):
         mapping.setdefault(b, m["symbol"])
     return mapping
 
-# --- NEW: resilient CoinGecko fetch with backoff ---
-def http_get_with_backoff(url, params=None, timeout=40):
-    headers = {"User-Agent": "liq-alerts/1.0 (+github.com/yourname)"}
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            r = requests.get(url, params=params, headers=headers, timeout=timeout)
-            if r.status_code == 429:
-                wait = float(r.headers.get("Retry-After", 0)) or (attempt * 2)
-                time.sleep(wait)
-                continue
-            r.raise_for_status()
-            return r
-        except requests.HTTPError:
-            if 500 <= r.status_code < 600 and attempt < MAX_RETRIES:
-                time.sleep(attempt * 2)
-                continue
-            raise
-        except requests.RequestException:
-            if attempt < MAX_RETRIES:
-                time.sleep(attempt * 2)
-                continue
-            raise
-
 def get_coins_in_cap_band_sorted():
+    """
+    Get all coins in the $50M–$500M cap band.
+    Sort by |1h move| desc; if 1h missing, use 24h; if both missing, 0.
+    """
+    time.sleep(INITIAL_COOLDOWN)  # cool down before first CG call
     coins = []
     page = 1
     while True:
@@ -104,7 +115,7 @@ def get_coins_in_cap_band_sorted():
             "page": page,
             "price_change_percentage": "1h,24h",
         }
-        r = http_get_with_backoff(CG_MARKETS, params=params, timeout=40)
+        r = http_get_with_backoff(CG_MARKETS, params=params, timeout=45)
         batch = r.json()
         if not batch:
             break
@@ -134,10 +145,10 @@ def get_coins_in_cap_band_sorted():
             break
 
         page += 1
-        if page > 20:
+        if page > 20:  # hard stop safety
             break
 
-        time.sleep(COINGECKO_PACE_SECONDS)  # <-- avoid 429
+        time.sleep(COINGECKO_PACE_SECONDS)  # pacing between pages
 
     coins.sort(key=lambda x: x["move_score"], reverse=True)
     return coins
@@ -172,9 +183,7 @@ def run_once():
         mc = coin["market_cap"]
 
         # Apply overrides first
-        sym = OVERRIDES.get(base)
-        if not sym:
-            sym = base_to_sym.get(base)
+        sym = OVERRIDES.get(base) or base_to_sym.get(base)
 
         if not sym:
             unmatched.append(f"{coin['symbol'].upper()} ({coin['name']}) — no Coinalyze perp found")
@@ -197,7 +206,7 @@ def run_once():
                 send_tg(msg)
                 alerted += 1
 
-        time.sleep(PACE_SECONDS)
+        time.sleep(PACE_SECONDS)  # respect Coinalyze limit
 
     if unmatched:
         head = "⚠️ Coins in $50–$500M cap band without a Coinalyze aggregated perp:"
