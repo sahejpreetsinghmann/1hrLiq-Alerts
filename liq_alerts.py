@@ -1,6 +1,7 @@
-# liq_alerts_debug_raw_hardened.py
+# liq_alerts_debug_raw_hardened_v2.py
 import time, random, hashlib, requests
 from datetime import datetime, timedelta, timezone
+from collections import deque
 
 # ====== TELEGRAM + COINALYZE (your details) ======
 CHAT_IDS = ["-4869615280"]
@@ -14,14 +15,16 @@ UPPER_CAP = 500_000_000
 MIN_24H_VOL = 10_000_000
 RATIO_THRESHOLD = 0.0002   # 0.02%
 MIN_LIQ_USD = 0
-PACE_SECONDS = 1.7
+
+# Coinalyze pacing / limits
+COINALYZE_CHUNK = 8          # symbols per request (smaller to avoid 429s)
+PACE_SECONDS = 2.4           # spacing between chunks
+COINALYZE_GLOBAL_RPM = 30    # soft cap: max requests/min to Coinalyze
+
 COINGECKO_PACE_SECONDS = 1.8
 MAX_RETRIES = 7
 INITIAL_COOLDOWN = 1.0
 SEND_NO_HITS_SUMMARY = True
-
-# Coinalyze batching
-COINALYZE_CHUNK = 20  # reduce to 10 if 429s persist
 
 # Manual overrides: CoinGecko symbol → list of Coinalyze perps
 OVERRIDES = {}
@@ -38,6 +41,12 @@ BASE_TO_CGID = {
     "ftm": "fantom", "sui": "sui", "sei": "sei-network",
 }
 
+# Bases we consider stablecoins and will EXCLUDE from querying.
+# NOTE: WUSDT (wormhole) is intentionally NOT included here.
+STABLE_BASES = {
+    "usdt","usdc","usd","susd","gusd","tusd","dai","usde","usdp","usdd","usds","usdx"
+}
+
 # -------- Endpoints --------
 COINALYZE_BASE = "https://api.coinalyze.net/v1"
 TG_BASE = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
@@ -46,39 +55,59 @@ CG_RANGE   = "https://api.coingecko.com/api/v3/coins/{id}/market_chart/range"
 
 # -------- HTTP helpers --------
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "liq-alerts/debug-raw-hardened"})
+SESSION.headers.update({"User-Agent": "liq-alerts/debug-raw-hardened-v2"})
 
 def _sleep_jitter(base: float):
     time.sleep(base + random.random() * 0.25)
 
+# Global soft rate limiter for Coinalyze
+_call_times = deque()  # timestamps of recent Coinalyze calls
+
+def _coinalyze_rate_gate():
+    now = time.time()
+    window = 60.0
+    while _call_times and (now - _call_times[0] > window):
+        _call_times.popleft()
+    if len(_call_times) >= COINALYZE_GLOBAL_RPM:
+        sleep_for = window - (now - _call_times[0]) + 0.05
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+    _call_times.append(time.time())
+
 def http_get_with_backoff(url, params=None, timeout=45):
     wait = 0.0
     last_err = None
-    for attempt in range(1, MAX_RETRIES + 1):
+    attempt = 1
+    while attempt <= MAX_RETRIES:
         if wait > 0:
             _sleep_jitter(wait)
+            wait = 0.0
         try:
             r = SESSION.get(url, params=params, timeout=timeout)
             if r.status_code == 429:
                 ra = r.headers.get("Retry-After")
-                wait = float(ra) if (ra and ra.isdigit()) else min(2 * attempt, 30)
-                print(f"[WARN] 429 on {url} attempt {attempt}/{MAX_RETRIES}; retry_after={ra or wait}s params={params}")
-                continue
+                try:
+                    block = float(ra) if (ra and float(ra) >= 0) else 30.0
+                except:
+                    block = 30.0
+                print(f"[WARN] 429 on {url}; blocking {block:.3f}s")
+                time.sleep(block + 0.25)
+                continue  # do NOT increment attempt; obey server backoff
             if 500 <= r.status_code < 600:
                 wait = min(2 * attempt, 30)
-                print(f"[WARN] {r.status_code} on {url} attempt {attempt}/{MAX_RETRIES}; retrying in {wait}s params={params}")
+                print(f"[WARN] {r.status_code} on {url} attempt {attempt}/{MAX_RETRIES}; retrying in {wait}s")
+                attempt += 1
                 continue
             if not (200 <= r.status_code < 300):
-                body = (r.text or "")[:500]
-                raise RuntimeError(f"HTTP {r.status_code} {url} params={params} body={body}")
+                body = (r.text or "")[:300]
+                raise RuntimeError(f"HTTP {r.status_code} {url} body={body}")
             return r
         except requests.RequestException as e:
             last_err = e
             wait = min(2 * attempt, 30)
-            print(f"[WARN] RequestException on {url} attempt {attempt}/{MAX_RETRIES}: {e}; retrying in {wait}s params={params}")
-        except RuntimeError:
-            raise
-    raise RuntimeError(f"GET failed after retries: {url} params={params} last_err={last_err}")
+            print(f"[WARN] RequestException {e} on {url} attempt {attempt}/{MAX_RETRIES}; retrying in {wait}s")
+            attempt += 1
+    raise RuntimeError(f"GET failed after retries: {url} last_err={last_err}")
 
 def coinalyze_get(path, params=None, timeout=45):
     params = dict(params or {})
@@ -96,7 +125,7 @@ def send_tg(text: str):
         except Exception as e:
             print(f"[WARN] Telegram send failed: {e}")
 
-def fmt_usd(x): 
+def fmt_usd(x):
     try: return f"${x:,.0f}"
     except: return f"${x}"
 
@@ -168,6 +197,7 @@ def get_market_cap_at_close(coin_id, ts_end):
 
 # -------- Coinalyze --------
 def group_perps_by_base():
+    # single call; no need to rate-gate
     markets = coinalyze_get("/future-markets", {})
     groups = {}
     for m in markets:
@@ -196,6 +226,7 @@ def liq_last_hour_by_base(base_to_symbols):
     for i in range(0, len(all_syms), CHUNK):
         chunk = all_syms[i:i+CHUNK]
         try:
+            _coinalyze_rate_gate()  # global RPM limiter
             data = coinalyze_get("/liquidation-history", {
                 "symbols": ",".join(chunk),
                 "interval": "1hour",
@@ -204,12 +235,13 @@ def liq_last_hour_by_base(base_to_symbols):
                 "convert_to_usd": "true"
             })
         except Exception as e:
-            print(f"[ERROR] Coinalyze batch failed for symbols={chunk}: {e}")
+            print(f"[ERROR] Coinalyze batch failed (size={len(chunk)}): {e}")
             # Fallback: try splitting once into two sub-chunks
             if len(chunk) > 1:
                 mid = len(chunk)//2
                 for sub in (chunk[:mid], chunk[mid:]):
                     try:
+                        _coinalyze_rate_gate()
                         data_sub = coinalyze_get("/liquidation-history", {
                             "symbols": ",".join(sub),
                             "interval": "1hour",
@@ -219,13 +251,11 @@ def liq_last_hour_by_base(base_to_symbols):
                         })
                         _accumulate_liqs(data_sub, symbol_to_base, raw_by_base, totals, frm, to)
                     except Exception as e2:
-                        print(f"[ERROR] Sub-chunk failed: {sub}: {e2}")
-            # continue to next chunk
+                        print(f"[ERROR] Sub-chunk failed (size={len(sub)}): {e2}")
             continue
 
-        # Normal path
         _accumulate_liqs(data, symbol_to_base, raw_by_base, totals, frm, to)
-        _sleep_jitter(PACE_SECONDS)
+        _sleep_jitter(PACE_SECONDS)  # gentle spacing
 
     return totals, raw_by_base, frm, to
 
@@ -255,10 +285,13 @@ def run_once():
     coins = get_coins_in_cap_band_sorted()
     base_groups_all = group_perps_by_base()
 
+    # Build base→symbols for candidate coins, exclude known stables (but NOT 'wusdt')
     base_to_symbols = {}
     unmatched = []
     for coin in coins:
-        base = coin["symbol"]
+        base = (coin["symbol"] or "").lower()
+        if base in STABLE_BASES:
+            continue
         if base in OVERRIDES:
             syms = OVERRIDES[base]
             if isinstance(syms, str): syms = [syms]
@@ -276,7 +309,9 @@ def run_once():
     print(f"[INFO] Window {frm}->{to} ({datetime.utcfromtimestamp(frm)} – {datetime.utcfromtimestamp(to)} UTC)")
 
     for coin in coins:
-        base = coin["symbol"]
+        base = (coin["symbol"] or "").lower()
+        if base in STABLE_BASES:  # skip stable bases
+            continue
         syms = base_to_symbols.get(base)
         if not syms:
             continue
@@ -286,10 +321,9 @@ def run_once():
             continue
         checked += 1
 
-        # quick pre-filter to avoid many CG /range calls
+        # pre-filter to avoid most CG /range calls
         est_ratio = liq_usd / max(coin["market_cap"], 1)
         if est_ratio < (RATIO_THRESHOLD * 0.6):
-            # still print if you want to see why it was skipped
             print(f"[DEBUG] {base.upper()} skipped by prefilter | liq={liq_usd:.2f} current_mc={coin['market_cap']:.2f} est_ratio={est_ratio:.5%}")
             continue
 
@@ -303,8 +337,7 @@ def run_once():
 
         # --- DEBUG PRINTS ---
         print(f"[DEBUG] {base.upper()} | liq_usd={liq_usd:.2f} | mc_close={mc_close:.2f} | ratio={ratio:.5%} | syms={syms}")
-        # Show last 3 raw history points for this base
-        raw = raw_by_base.get(base, [])[-3:]
+        raw = raw_by_base.get(base, [])[-3:]  # last 3 raw points
         for c in raw:
             try:
                 t = datetime.utcfromtimestamp(int(c['t']))
@@ -341,7 +374,6 @@ if __name__ == "__main__":
     try:
         run_once()
     except Exception as e:
-        # Surface fatal errors to Render logs and Telegram
         msg = f"❗ liq-alerts crashed: {e.__class__.__name__}: {e}"
         print(msg)
         send_tg(msg)
