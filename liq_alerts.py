@@ -12,8 +12,12 @@ LOWER_CAP = 50_000_000        # $50M
 UPPER_CAP = 500_000_000       # $500M
 RATIO_THRESHOLD = 0.0002      # 0.02% of market cap
 MIN_LIQ_USD = 0
-PACE_SECONDS = 1.7            # ~35 calls/min
+PACE_SECONDS = 1.7            # ~35 calls/min for Coinalyze
 SEND_NO_HITS_SUMMARY = True
+
+# CoinGecko rate-limiting
+COINGECKO_PACE_SECONDS = 1.5  # wait between CG requests
+MAX_RETRIES = 5
 
 # Manual overrides: CoinGecko symbol (lowercase) → Coinalyze aggregated perp symbol
 OVERRIDES = {
@@ -66,21 +70,45 @@ def map_base_to_agg_symbol(future_markets):
         mapping.setdefault(b, m["symbol"])
     return mapping
 
+# --- NEW: resilient CoinGecko fetch with backoff ---
+def http_get_with_backoff(url, params=None, timeout=40):
+    headers = {"User-Agent": "liq-alerts/1.0 (+github.com/yourname)"}
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=timeout)
+            if r.status_code == 429:
+                wait = float(r.headers.get("Retry-After", 0)) or (attempt * 2)
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            return r
+        except requests.HTTPError:
+            if 500 <= r.status_code < 600 and attempt < MAX_RETRIES:
+                time.sleep(attempt * 2)
+                continue
+            raise
+        except requests.RequestException:
+            if attempt < MAX_RETRIES:
+                time.sleep(attempt * 2)
+                continue
+            raise
+
 def get_coins_in_cap_band_sorted():
     coins = []
     page = 1
     while True:
-        r = requests.get(CG_MARKETS, params={
+        params = {
             "vs_currency": "usd",
             "order": "market_cap_desc",
             "per_page": 250,
             "page": page,
-            "price_change_percentage": "1h,24h"
-        }, timeout=40)
-        r.raise_for_status()
+            "price_change_percentage": "1h,24h",
+        }
+        r = http_get_with_backoff(CG_MARKETS, params=params, timeout=40)
         batch = r.json()
         if not batch:
             break
+
         stop = False
         for c in batch:
             mc = c.get("market_cap")
@@ -101,11 +129,16 @@ def get_coins_in_cap_band_sorted():
                     "market_cap": mc,
                     "move_score": move_score
                 })
+
         if stop:
             break
+
         page += 1
         if page > 20:
             break
+
+        time.sleep(COINGECKO_PACE_SECONDS)  # <-- avoid 429
+
     coins.sort(key=lambda x: x["move_score"], reverse=True)
     return coins
 
