@@ -1,4 +1,4 @@
-# liq_alerts_v5.py
+# liq_alerts_v7.py
 import time, random, hashlib, requests, re
 from datetime import datetime, timedelta, timezone
 from collections import deque
@@ -26,7 +26,7 @@ MAX_RETRIES = 7
 INITIAL_COOLDOWN = 1.0
 SEND_NO_HITS_SUMMARY = True
 
-# Manual overrides still supported
+# Manual overrides still supported (usually not needed with rescue scan)
 OVERRIDES = {}
 
 # Explicit mapping to avoid symbol collisions (base → CG ID)
@@ -54,7 +54,7 @@ CG_RANGE   = "https://api.coingecko.com/api/v3/coins/{id}/market_chart/range"
 
 # -------- HTTP helpers --------
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "liq-alerts/v5"})
+SESSION.headers.update({"User-Agent": "liq-alerts/v7"})
 
 def _sleep_jitter(base: float):
     time.sleep(base + random.random() * 0.25)
@@ -119,7 +119,7 @@ def fmt_usd(x):
 
 def last_completed_hour_window():
     now = datetime.now(timezone.utc)
-    end = now.replace(minute=0, second=0, microsecond=0)
+    end = now.replace(minute=0, second=0, microsecond=0)  # top of current hour
     start = end - timedelta(hours=1)
     return int(start.timestamp()), int(end.timestamp())
 
@@ -161,9 +161,11 @@ def get_coins_in_cap_band_sorted():
         _sleep_jitter(COINGECKO_PACE_SECONDS)
     coins=list(by_symbol.values())
     coins.sort(key=lambda x:x["move_score"],reverse=True)
+    print(f"[INFO] CG candidates: {len(coins)}")
     return coins
 
 def get_market_cap_at_close(coin_id, ts_end):
+    # Choose the last market cap <= bar end
     frm=ts_end-30*60; to=ts_end+1
     url=CG_RANGE.format(id=coin_id)
     r=http_get_with_backoff(url,params={"vs_currency":"usd","from":frm,"to":to})
@@ -193,8 +195,7 @@ def group_perps_by_base():
     Returns: (groups: dict[str, list[str]], markets: list[dict])
     """
     markets = coinalyze_get("/future-markets", {})
-    agg = {}
-    per_ex = {}
+    agg = {}; per_ex = {}
     for m in markets:
         sym = m.get("symbol","")
         if "_PERP" not in sym: continue
@@ -249,8 +250,11 @@ def liq_last_hour_by_base(base_to_symbols):
         try:
             _coinalyze_rate_gate()
             data=coinalyze_get("/liquidation-history",{
-                "symbols":",".join(chunk),"interval":"1hour",
-                "from":frm,"to":to,"convert_to_usd":"true"})
+                "symbols":",".join(chunk),
+                "interval":"1hour",
+                "from":frm,
+                "to":to-1,                 # <-- end exclusive to avoid next hour
+                "convert_to_usd":"true"})
         except Exception as e:
             print(f"[ERROR] Coinalyze batch failed (size={len(chunk)}): {e}")
             if len(chunk)>1:
@@ -259,8 +263,11 @@ def liq_last_hour_by_base(base_to_symbols):
                     try:
                         _coinalyze_rate_gate()
                         data_sub=coinalyze_get("/liquidation-history",{
-                            "symbols":",".join(sub),"interval":"1hour",
-                            "from":frm,"to":to,"convert_to_usd":"true"})
+                            "symbols":",".join(sub),
+                            "interval":"1hour",
+                            "from":frm,
+                            "to":to-1,       # <-- also exclusive here
+                            "convert_to_usd":"true"})
                         _accumulate_liqs(data_sub,symbol_to_base,raw_by_base,totals,frm,to)
                     except Exception as e2:
                         print(f"[ERROR] Sub-chunk failed (size={len(sub)}): {e2}")
@@ -271,17 +278,35 @@ def liq_last_hour_by_base(base_to_symbols):
 
 def _accumulate_liqs(data,symbol_to_base,raw_by_base,totals,frm,to):
     for entry in data:
-        b=symbol_to_base.get(entry.get("symbol"))
-        if not b: continue
+        base_key=symbol_to_base.get(entry.get("symbol"))
+        if not base_key: 
+            continue
         hist=entry.get("history",[])
-        if hist:
-            raw_by_base.setdefault(b,[]).extend(hist)
-            for c in reversed(hist):
-                try: t=int(c.get("t",0))
-                except: continue
-                if frm<=t<=to:
-                    l=float(c.get("l",0)); s=float(c.get("s",0))
-                    totals[b]+=l+s; break
+        if not hist:
+            continue
+
+        raw_by_base.setdefault(base_key,[]).extend(hist)
+
+        # Prefer the candle that starts exactly at frm; else latest < to
+        target=None
+        latest_lt=None
+        for c in hist:
+            try:
+                t=int(c.get("t",0))
+            except:
+                continue
+            if t==frm:
+                target=c
+                break
+            if t<to:
+                if (latest_lt is None) or (t>int(latest_lt.get("t",0))):
+                    latest_lt=c
+        if target is None:
+            target=latest_lt
+
+        if target:
+            l=float(target.get("l",0)); s=float(target.get("s",0))
+            totals[base_key]+=l+s
 
 # -------- Main --------
 _seen_alerts=set()
@@ -324,12 +349,6 @@ def run_once():
         liq_usd=float(liq_by_base.get(base_raw.lower(),0.0))
         if liq_usd<MIN_LIQ_USD: continue
         checked+=1
-
-        # pre-filter to avoid most CG /range calls
-        est_ratio=liq_usd/max(coin["market_cap"],1)
-        if est_ratio<(RATIO_THRESHOLD*0.6):
-            print(f"[DEBUG] {base_raw.upper()} skipped by prefilter | liq={liq_usd:.2f} current_mc={coin['market_cap']:.2f} est_ratio={est_ratio:.5%}")
-            continue
 
         cg_id=BASE_TO_CGID.get(base_raw.lower(),coin["id"])
         mc_close=get_market_cap_at_close(cg_id,to)
