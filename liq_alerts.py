@@ -1,4 +1,4 @@
-# liq_alerts_v9.py
+# liq_alerts_v10_slow2.py
 import time, random, hashlib, requests, re
 from datetime import datetime, timedelta, timezone
 from collections import deque
@@ -16,20 +16,24 @@ MIN_24H_VOL = 10_000_000
 RATIO_THRESHOLD = 0.0002   # 0.02%
 MIN_LIQ_USD = 0
 
-# Coinalyze pacing / limits (SLOWED to avoid 429s)
-COINALYZE_CHUNK = 5
-PACE_SECONDS = 3.5
-COINALYZE_GLOBAL_RPM = 20
+# Coinalyze pacing / limits (SLOWED further to avoid 429s)
+COINALYZE_CHUNK = 4
+PACE_SECONDS = 4.5
+COINALYZE_GLOBAL_RPM = 15
 
-COINGECKO_PACE_SECONDS = 2.2
+# CoinGecko pacing (slower)
+COINGECKO_PACE_SECONDS = 2.6
 MAX_RETRIES = 7
-INITIAL_COOLDOWN = 1.0
+INITIAL_COOLDOWN = 1.2
 SEND_NO_HITS_SUMMARY = True
 
 # Skip CG /range if liq can't possibly alert within cap band
 MIN_LIQ_FOR_POSSIBLE_ALERT = RATIO_THRESHOLD * LOWER_CAP  # e.g., $10,000
 
-# Manual overrides still supported (usually not needed with rescue scan)
+# Prefer aggregated markets when available
+PREFER_AGGREGATED = True
+
+# Manual overrides
 OVERRIDES = {}
 
 # Explicit mapping to avoid symbol collisions (base → CG ID)
@@ -45,9 +49,7 @@ BASE_TO_CGID = {
 }
 
 # Stables to exclude (WUSDT intentionally NOT included)
-STABLE_BASES = {
-    "usdt","usdc","usd","susd","gusd","tusd","dai","usde","usdp","usdd","usds","usdx"
-}
+STABLE_BASES = {"usdt","usdc","usd","susd","gusd","tusd","dai","usde","usdp","usdd","usds","usdx"}
 
 # -------- Endpoints --------
 COINALYZE_BASE = "https://api.coinalyze.net/v1"
@@ -57,10 +59,10 @@ CG_RANGE   = "https://api.coingecko.com/api/v3/coins/{id}/market_chart/range"
 
 # -------- HTTP helpers --------
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "liq-alerts/v9"})
+SESSION.headers.update({"User-Agent": "liq-alerts/v10-slow2"})
 
 def _sleep_jitter(base: float):
-    time.sleep(base + random.random() * 0.25)
+    time.sleep(base + random.random() * 0.35)
 
 # Global soft rate limiter for Coinalyze
 _call_times = deque()
@@ -81,14 +83,14 @@ def http_get_with_backoff(url, params=None, timeout=45):
             if r.status_code == 429:
                 ra = r.headers.get("Retry-After")
                 try:
-                    block = max(0.0, float(ra)) if ra is not None else 60.0
+                    block = max(0.0, float(ra)) if ra is not None else 70.0
                 except:
-                    block = 60.0
+                    block = 70.0
                 print(f"[WARN] 429 on {url}; blocking {block:.3f}s")
-                time.sleep(block + 0.25)
+                time.sleep(block + 0.35)
                 continue  # don’t count as an attempt
             if 500 <= r.status_code < 600:
-                wait = min(2 * attempt, 30)
+                wait = min(2 * attempt, 35)
                 print(f"[WARN] {r.status_code} on {url} attempt {attempt}/{MAX_RETRIES}; retry in {wait}s")
                 attempt += 1; continue
             if not (200 <= r.status_code < 300):
@@ -96,7 +98,7 @@ def http_get_with_backoff(url, params=None, timeout=45):
                 raise RuntimeError(f"HTTP {r.status_code} {url} body={body}")
             return r
         except requests.RequestException as e:
-            last_err = e; wait = min(2 * attempt, 30)
+            last_err = e; wait = min(2 * attempt, 35)
             print(f"[WARN] RequestException {e} on {url} attempt {attempt}/{MAX_RETRIES}; retry in {wait}s")
             attempt += 1
     raise RuntimeError(f"GET failed after retries: {url} last_err={last_err}")
@@ -112,7 +114,7 @@ def send_tg(text: str):
         try:
             SESSION.post(f"{TG_BASE}/sendMessage",
                          json={"chat_id": cid, "text": text, "disable_web_page_preview": True},
-                         timeout=20)
+                         timeout=25)
         except Exception as e:
             print(f"[WARN] Telegram send failed: {e}")
 
@@ -122,7 +124,7 @@ def fmt_usd(x):
 
 def last_completed_hour_window():
     now = datetime.now(timezone.utc)
-    end = now.replace(minute=0, second=0, microsecond=0)  # top of current hour
+    end = now.replace(minute=0, second=0, microsecond=0)
     start = end - timedelta(hours=1)
     return int(start.timestamp()), int(end.timestamp())
 
@@ -169,18 +171,16 @@ def get_coins_in_cap_band_sorted():
 
 # Cache for CG /range calls
 _MC_CACHE = {}
-_MC_CACHE_MAX = 200
+_MC_CACHE_MAX = 220
 
 def get_market_cap_at_close(coin_id, ts_end):
     key = (coin_id, ts_end)
     if key in _MC_CACHE:
         return _MC_CACHE[key]
-
     frm=ts_end-30*60; to=ts_end+1
     url=CG_RANGE.format(id=coin_id)
     r=http_get_with_backoff(url,params={"vs_currency":"usd","from":frm,"to":to})
-    _sleep_jitter(1.8)  # gentle pacing per /range hit
-
+    _sleep_jitter(2.2)  # gentler per /range
     series=r.json().get("market_caps") or []
     if not series:
         val = 0.0
@@ -191,7 +191,6 @@ def get_market_cap_at_close(coin_id, ts_end):
             else: break
         if best is None: best=series[-1][1]
         val = float(best or 0.0)
-
     if len(_MC_CACHE) >= _MC_CACHE_MAX:
         _MC_CACHE.pop(next(iter(_MC_CACHE)))
     _MC_CACHE[key] = val
@@ -201,57 +200,53 @@ def get_market_cap_at_close(coin_id, ts_end):
 _QUOTE_SUFFIXES = ["USDT","USD","USDC","BUSD","FDUSD","USDE","TUSD","USDP","USDD","USDX"]
 
 def _base_from_symbol(sym: str) -> str:
-    head = sym.split("_PERP", 1)[0]  # e.g. SOMIUSDT
+    head = sym.split("_PERP", 1)[0]
     for q in _QUOTE_SUFFIXES:
         if head.endswith(q):
             return head[:-len(q)]
     return head
 
-def group_perps_by_base():
-    """
-    Prefer aggregated .A markets; if no .A, fall back to ALL per-exchange.
-    Index groups under BOTH normalized base_asset and normalized base parsed from symbol.
-    Returns: (groups: dict[str, list[str]], markets: list[dict])
-    """
+def group_perps_by_base_both():
     markets = coinalyze_get("/future-markets", {})
-    agg = {}; per_ex = {}
+    agg_groups = {}; perex_groups = {}
     for m in markets:
         sym = m.get("symbol","")
         if "_PERP" not in sym: continue
-        b1 = norm(m.get("base_asset",""))     # e.g. "somnia"
-        b2 = norm(_base_from_symbol(sym))     # e.g. "somi"
-        target = agg if sym.endswith(".A") else per_ex
+        b1 = norm(m.get("base_asset",""))
+        b2 = norm(_base_from_symbol(sym))
+        target = agg_groups if sym.endswith(".A") else perex_groups
         if b1: target.setdefault(b1, []).append(sym)
         if b2 and b2 != b1: target.setdefault(b2, []).append(sym)
-    groups = {}
-    for k in set(agg) | set(per_ex):
-        groups[k] = agg.get(k) or per_ex.get(k, [])
-    return groups, markets
+    return agg_groups, perex_groups, markets
 
-def resolve_syms_for_coin(coin, groups, markets):
-    """
-    Try multiple normalized keys (symbol/name/id). If none found, RESCUE by
-    scanning raw market symbols like ^BASE(USDT|USD|USDC|...).*_PERP .
-    """
+def resolve_syms_for_coin(coin, agg_groups, perex_groups, markets):
     base_raw = (coin.get("symbol") or "")
-    base_norm = norm(base_raw)
-    candidates = [base_norm, norm(coin.get("name","")), norm(coin.get("id",""))]
-
-    # 1) Normal path: keyed groups
-    for k in candidates:
-        if k and k in groups and groups[k]:
-            return groups[k], "groups"
-
-    # 2) Rescue: scan the symbols text
+    cands = [norm(base_raw), norm(coin.get("name","")), norm(coin.get("id",""))]
+    if PREFER_AGGREGATED:
+        for k in cands:
+            lst = agg_groups.get(k) or []
+            if lst:
+                print(f"[RESOLVE] {base_raw.upper()} -> AGG {len(lst)} symbols via key='{k}'")
+                return sorted(set(lst)), "agg"
+    for k in cands:
+        lst = perex_groups.get(k) or []
+        if lst:
+            print(f"[RESOLVE] {base_raw.upper()} -> PER-EX {len(lst)} symbols via key='{k}'")
+            return sorted(set(lst)), "perex"
+    # Rescue scan
     if base_raw:
         base_up = base_raw.upper()
         quote_alt = "|".join(_QUOTE_SUFFIXES)
         rx = re.compile(rf"^{re.escape(base_up)}(?:{quote_alt}).*_PERP", re.IGNORECASE)
         hits = [m.get("symbol") for m in markets if rx.match(m.get("symbol",""))]
         if hits:
-            print(f"[INFO] RESCUE matched {base_raw.upper()} via symbol scan: {hits[:4]}{'...' if len(hits)>4 else ''}")
-            return hits, "rescue"
-
+            agg_hits = [h for h in hits if h.endswith(".A")]
+            if agg_hits and PREFER_AGGREGATED:
+                print(f"[INFO] RESCUE {base_up}: AGG {len(agg_hits)} from symbol scan")
+                return sorted(set(agg_hits)), "agg-rescue"
+            print(f"[INFO] RESCUE {base_up}: PER-EX {len(hits)} from symbol scan")
+            perex_only = [h for h in hits if not h.endswith(".A")]
+            return sorted(set(perex_only)), "perex-rescue"
     return None, "none"
 
 def liq_last_hour_by_base(base_to_symbols):
@@ -263,7 +258,7 @@ def liq_last_hour_by_base(base_to_symbols):
     longs={b:0.0 for b in base_to_symbols}
     shorts={b:0.0 for b in base_to_symbols}
     raw_by_base={}
-    breakdown_by_base={}  # base -> list of dicts: {'symbol', 'l', 's', 't'}
+    breakdown_by_base={}
 
     if not all_syms:
         print("[INFO] No symbols to query in Coinalyze.")
@@ -278,7 +273,7 @@ def liq_last_hour_by_base(base_to_symbols):
                 "symbols":",".join(chunk),
                 "interval":"1hour",
                 "from":frm,
-                "to":to-1,                 # end exclusive to avoid next hour
+                "to":to-1,                 # end exclusive
                 "convert_to_usd":"true"})
         except Exception as e:
             print(f"[ERROR] Coinalyze batch failed (size={len(chunk)}): {e}")
@@ -336,10 +331,7 @@ def _accumulate_liqs(data,symbol_to_base,raw_by_base,breakdown_by_base,totals,lo
             longs[base_key]+=l
             shorts[base_key]+=s
             breakdown_by_base.setdefault(base_key,[]).append({
-                "symbol": sym,
-                "l": l,
-                "s": s,
-                "t": int(target.get("t",0))
+                "symbol": sym, "l": l, "s": s, "t": int(target.get("t",0))
             })
 
 # -------- Main --------
@@ -347,25 +339,24 @@ _seen_alerts=set()
 
 def run_once():
     coins=get_coins_in_cap_band_sorted()
-    groups, markets = group_perps_by_base()
+    agg_groups, perex_groups, markets = group_perps_by_base_both()
 
     base_to_symbols={}; unmatched=[]
     for coin in coins:
-        base_raw=(coin["symbol"] or "")
-        # Skip only true stables; WUSDT is allowed
-        if base_raw.lower() in STABLE_BASES:
-            continue
+        base_raw=(coin["symbol"] or ""); base=base_raw.lower()
+        if base in STABLE_BASES: continue
 
-        # Overrides (optional)
-        if base_raw.lower() in OVERRIDES:
-            syms=OVERRIDES[base_raw.lower()]
+        if base in OVERRIDES:
+            syms=OVERRIDES[base]
             if isinstance(syms,str): syms=[syms]
-            base_to_symbols[base_raw.lower()]=syms
+            base_to_symbols[base]=sorted(set(syms))
+            print(f"[RESOLVE] {base_raw.upper()} -> OVERRIDE {len(base_to_symbols[base])} symbols")
             continue
 
-        syms, how = resolve_syms_for_coin(coin, groups, markets)
+        syms, how = resolve_syms_for_coin(coin, agg_groups, perex_groups, markets)
         if syms:
-            base_to_symbols[base_raw.lower()] = syms
+            only_agg = [s for s in syms if s.endswith(".A")]
+            base_to_symbols[base] = sorted(set(only_agg)) if only_agg and PREFER_AGGREGATED else sorted(set([s for s in syms if not s.endswith(".A")]))
         else:
             unmatched.append(f"{base_raw.upper()} ({coin['name']}) — no perps")
 
@@ -375,8 +366,7 @@ def run_once():
     print(f"[INFO] Window {frm}->{to} ({datetime.fromtimestamp(frm, timezone.utc)} – {datetime.fromtimestamp(to, timezone.utc)} UTC)")
 
     for coin in coins:
-        base_raw=(coin["symbol"] or "")
-        base=base_raw.lower()
+        base_raw=(coin["symbol"] or ""); base=base_raw.lower()
         if base in STABLE_BASES: continue
         syms=base_to_symbols.get(base)
         if not syms: continue
@@ -387,9 +377,8 @@ def run_once():
         if liq_usd<MIN_LIQ_USD: continue
         checked+=1
 
-        # Math-impossible check to avoid unnecessary CG /range calls
         if liq_usd < MIN_LIQ_FOR_POSSIBLE_ALERT:
-            print(f"[DEBUG] {base_raw.upper()} skipped (liq < min needed for any alert) | liq={liq_usd:.2f} need>={MIN_LIQ_FOR_POSSIBLE_ALERT:.2f}")
+            print(f"[DEBUG] {base_raw.upper()} skipped (liq < min for any alert) | liq={liq_usd:.2f} need>={MIN_LIQ_FOR_POSSIBLE_ALERT:.2f}")
             continue
 
         cg_id=BASE_TO_CGID.get(base,coin["id"])
@@ -400,15 +389,15 @@ def run_once():
 
         ratio=liq_usd/mc_close
 
-        # ---- Detailed per-symbol breakdown in logs ----
+        # Per-symbol breakdown in logs
         br_list = breakdown_by_base.get(base, [])
         if br_list:
-            print(f"[BRK] {base_raw.upper()} per-symbol liquidation (used in total) for {datetime.fromtimestamp(frm, timezone.utc)}–{datetime.fromtimestamp(to, timezone.utc)} UTC:")
+            print(f"[BRK] {base_raw.upper()} symbols used ({'AGG' if all(s['symbol'].endswith('.A') for s in br_list) else 'PER-EX'}) for {datetime.fromtimestamp(frm, timezone.utc)}–{datetime.fromtimestamp(to, timezone.utc)} UTC:")
             for br in sorted(br_list, key=lambda x: x["symbol"]):
                 print(f"       {br['symbol']:<28} long={br['l']:.2f} short={br['s']:.2f} total={br['l']+br['s']:.2f}")
 
-        # Debug + optional last bars
         print(f"[DEBUG] {base_raw.upper()} | liq_usd={liq_usd:.2f} (long={liq_l:.2f} short={liq_s:.2f}) | mc_close={mc_close:.2f} | ratio={ratio*100:.4f}% | syms={syms}")
+
         raw=raw_by_base.get(base, [])[-3:]
         for c in raw:
             try: t=datetime.fromtimestamp(int(c['t']), timezone.utc)
