@@ -1,4 +1,4 @@
-# liq_alerts_v7_slow.py
+# liq_alerts_v9.py
 import time, random, hashlib, requests, re
 from datetime import datetime, timedelta, timezone
 from collections import deque
@@ -16,15 +16,18 @@ MIN_24H_VOL = 10_000_000
 RATIO_THRESHOLD = 0.0002   # 0.02%
 MIN_LIQ_USD = 0
 
-# Coinalyze pacing / limits (SLOWED)
-COINALYZE_CHUNK = 5          # symbols per request (smaller batch)
-PACE_SECONDS = 3.5           # spacing between chunks (slower)
-COINALYZE_GLOBAL_RPM = 20    # global soft cap: max requests/minute
+# Coinalyze pacing / limits (SLOWED to avoid 429s)
+COINALYZE_CHUNK = 5
+PACE_SECONDS = 3.5
+COINALYZE_GLOBAL_RPM = 20
 
-COINGECKO_PACE_SECONDS = 1.8
+COINGECKO_PACE_SECONDS = 2.2
 MAX_RETRIES = 7
 INITIAL_COOLDOWN = 1.0
 SEND_NO_HITS_SUMMARY = True
+
+# Skip CG /range if liq can't possibly alert within cap band
+MIN_LIQ_FOR_POSSIBLE_ALERT = RATIO_THRESHOLD * LOWER_CAP  # e.g., $10,000
 
 # Manual overrides still supported (usually not needed with rescue scan)
 OVERRIDES = {}
@@ -54,7 +57,7 @@ CG_RANGE   = "https://api.coingecko.com/api/v3/coins/{id}/market_chart/range"
 
 # -------- HTTP helpers --------
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "liq-alerts/v7-slow"})
+SESSION.headers.update({"User-Agent": "liq-alerts/v9"})
 
 def _sleep_jitter(base: float):
     time.sleep(base + random.random() * 0.25)
@@ -78,9 +81,9 @@ def http_get_with_backoff(url, params=None, timeout=45):
             if r.status_code == 429:
                 ra = r.headers.get("Retry-After")
                 try:
-                    block = max(0.0, float(ra)) if ra is not None else 30.0
+                    block = max(0.0, float(ra)) if ra is not None else 60.0
                 except:
-                    block = 30.0
+                    block = 60.0
                 print(f"[WARN] 429 on {url}; blocking {block:.3f}s")
                 time.sleep(block + 0.25)
                 continue  # don’t count as an attempt
@@ -164,19 +167,35 @@ def get_coins_in_cap_band_sorted():
     print(f"[INFO] CG candidates: {len(coins)}")
     return coins
 
+# Cache for CG /range calls
+_MC_CACHE = {}
+_MC_CACHE_MAX = 200
+
 def get_market_cap_at_close(coin_id, ts_end):
-    # Choose the last market cap <= bar end
+    key = (coin_id, ts_end)
+    if key in _MC_CACHE:
+        return _MC_CACHE[key]
+
     frm=ts_end-30*60; to=ts_end+1
     url=CG_RANGE.format(id=coin_id)
     r=http_get_with_backoff(url,params={"vs_currency":"usd","from":frm,"to":to})
+    _sleep_jitter(1.8)  # gentle pacing per /range hit
+
     series=r.json().get("market_caps") or []
-    if not series: return 0.0
-    target_ms=ts_end*1000; best=None
-    for ms,val in series:
-        if ms<=target_ms: best=val
-        else: break
-    if best is None: best=series[-1][1]
-    return float(best or 0.0)
+    if not series:
+        val = 0.0
+    else:
+        target_ms=ts_end*1000; best=None
+        for ms,val_ in series:
+            if ms<=target_ms: best=val_
+            else: break
+        if best is None: best=series[-1][1]
+        val = float(best or 0.0)
+
+    if len(_MC_CACHE) >= _MC_CACHE_MAX:
+        _MC_CACHE.pop(next(iter(_MC_CACHE)))
+    _MC_CACHE[key] = val
+    return val
 
 # -------- Coinalyze --------
 _QUOTE_SUFFIXES = ["USDT","USD","USDC","BUSD","FDUSD","USDE","TUSD","USDP","USDD","USDX"]
@@ -239,11 +258,17 @@ def liq_last_hour_by_base(base_to_symbols):
     frm,to=last_completed_hour_window()
     all_syms=sorted({s for syms in base_to_symbols.values() for s in syms})
     symbol_to_base={s:b for b,syms in base_to_symbols.items() for s in syms}
+
     totals={b:0.0 for b in base_to_symbols}
+    longs={b:0.0 for b in base_to_symbols}
+    shorts={b:0.0 for b in base_to_symbols}
     raw_by_base={}
+    breakdown_by_base={}  # base -> list of dicts: {'symbol', 'l', 's', 't'}
+
     if not all_syms:
         print("[INFO] No symbols to query in Coinalyze.")
-        return totals,raw_by_base,frm,to
+        return totals,longs,shorts,raw_by_base,breakdown_by_base,frm,to
+
     CHUNK=COINALYZE_CHUNK
     for i in range(0,len(all_syms),CHUNK):
         chunk=all_syms[i:i+CHUNK]
@@ -268,18 +293,19 @@ def liq_last_hour_by_base(base_to_symbols):
                             "from":frm,
                             "to":to-1,
                             "convert_to_usd":"true"})
-                        _accumulate_liqs(data_sub,symbol_to_base,raw_by_base,totals,frm,to)
+                        _accumulate_liqs(data_sub,symbol_to_base,raw_by_base,breakdown_by_base,totals,longs,shorts,frm,to)
                     except Exception as e2:
                         print(f"[ERROR] Sub-chunk failed (size={len(sub)}): {e2}")
             continue
-        _accumulate_liqs(data,symbol_to_base,raw_by_base,totals,frm,to)
+        _accumulate_liqs(data,symbol_to_base,raw_by_base,breakdown_by_base,totals,longs,shorts,frm,to)
         _sleep_jitter(PACE_SECONDS)
-    return totals,raw_by_base,frm,to
+    return totals,longs,shorts,raw_by_base,breakdown_by_base,frm,to
 
-def _accumulate_liqs(data,symbol_to_base,raw_by_base,totals,frm,to):
+def _accumulate_liqs(data,symbol_to_base,raw_by_base,breakdown_by_base,totals,longs,shorts,frm,to):
     for entry in data:
-        base_key=symbol_to_base.get(entry.get("symbol"))
-        if not base_key: 
+        sym = entry.get("symbol")
+        base_key=symbol_to_base.get(sym)
+        if not base_key:
             continue
         hist=entry.get("history",[])
         if not hist:
@@ -307,6 +333,14 @@ def _accumulate_liqs(data,symbol_to_base,raw_by_base,totals,frm,to):
         if target:
             l=float(target.get("l",0)); s=float(target.get("s",0))
             totals[base_key]+=l+s
+            longs[base_key]+=l
+            shorts[base_key]+=s
+            breakdown_by_base.setdefault(base_key,[]).append({
+                "symbol": sym,
+                "l": l,
+                "s": s,
+                "t": int(target.get("t",0))
+            })
 
 # -------- Main --------
 _seen_alerts=set()
@@ -335,48 +369,66 @@ def run_once():
         else:
             unmatched.append(f"{base_raw.upper()} ({coin['name']}) — no perps")
 
-    liq_by_base,raw_by_base,frm,to=liq_last_hour_by_base(base_to_symbols)
+    totals,longs,shorts,raw_by_base,breakdown_by_base,frm,to=liq_last_hour_by_base(base_to_symbols)
     checked=0; alerted=0
 
-    print(f"[INFO] Window {frm}->{to} ({datetime.utcfromtimestamp(frm)} – {datetime.utcfromtimestamp(to)} UTC)")
+    print(f"[INFO] Window {frm}->{to} ({datetime.fromtimestamp(frm, timezone.utc)} – {datetime.fromtimestamp(to, timezone.utc)} UTC)")
 
     for coin in coins:
         base_raw=(coin["symbol"] or "")
-        if base_raw.lower() in STABLE_BASES: continue
-        syms=base_to_symbols.get(base_raw.lower())
+        base=base_raw.lower()
+        if base in STABLE_BASES: continue
+        syms=base_to_symbols.get(base)
         if not syms: continue
 
-        liq_usd=float(liq_by_base.get(base_raw.lower(),0.0))
+        liq_usd=float(totals.get(base,0.0))
+        liq_l=float(longs.get(base,0.0))
+        liq_s=float(shorts.get(base,0.0))
         if liq_usd<MIN_LIQ_USD: continue
         checked+=1
 
-        cg_id=BASE_TO_CGID.get(base_raw.lower(),coin["id"])
+        # Math-impossible check to avoid unnecessary CG /range calls
+        if liq_usd < MIN_LIQ_FOR_POSSIBLE_ALERT:
+            print(f"[DEBUG] {base_raw.upper()} skipped (liq < min needed for any alert) | liq={liq_usd:.2f} need>={MIN_LIQ_FOR_POSSIBLE_ALERT:.2f}")
+            continue
+
+        cg_id=BASE_TO_CGID.get(base,coin["id"])
         mc_close=get_market_cap_at_close(cg_id,to)
         if mc_close<=0 or not(LOWER_CAP<=mc_close<=UPPER_CAP):
             print(f"[DEBUG] {base_raw.upper()} dropped by historical MC band | mc_close={mc_close:.2f}")
             continue
 
         ratio=liq_usd/mc_close
-        print(f"[DEBUG] {base_raw.upper()} | liq_usd={liq_usd:.2f} | mc_close={mc_close:.2f} | ratio={ratio:.5%} | syms={syms}")
-        raw=raw_by_base.get(base_raw.lower(), [])[-3:]
+
+        # ---- Detailed per-symbol breakdown in logs ----
+        br_list = breakdown_by_base.get(base, [])
+        if br_list:
+            print(f"[BRK] {base_raw.upper()} per-symbol liquidation (used in total) for {datetime.fromtimestamp(frm, timezone.utc)}–{datetime.fromtimestamp(to, timezone.utc)} UTC:")
+            for br in sorted(br_list, key=lambda x: x["symbol"]):
+                print(f"       {br['symbol']:<28} long={br['l']:.2f} short={br['s']:.2f} total={br['l']+br['s']:.2f}")
+
+        # Debug + optional last bars
+        print(f"[DEBUG] {base_raw.upper()} | liq_usd={liq_usd:.2f} (long={liq_l:.2f} short={liq_s:.2f}) | mc_close={mc_close:.2f} | ratio={ratio*100:.4f}% | syms={syms}")
+        raw=raw_by_base.get(base, [])[-3:]
         for c in raw:
-            try: t=datetime.utcfromtimestamp(int(c['t']))
+            try: t=datetime.fromtimestamp(int(c['t']), timezone.utc)
             except: continue
             l=float(c.get('l',0)); s=float(c.get('s',0))
             print(f"    [RAW] {base_raw.upper()} {t} UTC | long={l} short={s}")
 
         if ratio>=RATIO_THRESHOLD:
-            key=idem_key(sorted(syms),frm,to,round(ratio,6))
+            key=idem_key(sorted(syms),frm,to,round(ratio,8))
             if key in _seen_alerts: continue
             _seen_alerts.add(key)
-            window=(f"{datetime.fromtimestamp(frm,tz=timezone.utc):%Y-%m-%d %H:%M}"
-                    f"–{datetime.fromtimestamp(to,tz=timezone.utc):%H:%M} UTC")
+            window=(f"{datetime.fromtimestamp(frm, tz=timezone.utc):%Y-%m-%d %H:%M}"
+                    f"–{datetime.fromtimestamp(to, tz=timezone.utc):%H:%M} UTC")
             msg=(f"🔔 Liq/MC ≥ {RATIO_THRESHOLD*100:.3f}% (at close)\n"
                  f"Ticker: {', '.join(syms)}\n"
                  f"Window: {window}\n"
-                 f"Liquidations: {fmt_usd(liq_usd)}\n"
+                 f"Liquidations: {fmt_usd(liq_usd)} "
+                 f"(long {fmt_usd(liq_l)}, short {fmt_usd(liq_s)})\n"
                  f"MC (close): {fmt_usd(mc_close)}\n"
-                 f"Liq/MC: {ratio*100:.3f}%")
+                 f"Liq/MC: {ratio*100:.4f}%")
             send_tg(msg); alerted+=1
 
     if unmatched:
