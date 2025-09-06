@@ -1,4 +1,4 @@
-# liq_alerts_debug_raw_hardened_v2.py
+# liq_alerts_v3.py
 import time, random, hashlib, requests
 from datetime import datetime, timedelta, timezone
 from collections import deque
@@ -17,7 +17,7 @@ RATIO_THRESHOLD = 0.0002   # 0.02%
 MIN_LIQ_USD = 0
 
 # Coinalyze pacing / limits
-COINALYZE_CHUNK = 8          # symbols per request (smaller to avoid 429s)
+COINALYZE_CHUNK = 8          # symbols per request (reduce to 5 if 429s persist)
 PACE_SECONDS = 2.4           # spacing between chunks
 COINALYZE_GLOBAL_RPM = 30    # soft cap: max requests/min to Coinalyze
 
@@ -26,7 +26,7 @@ MAX_RETRIES = 7
 INITIAL_COOLDOWN = 1.0
 SEND_NO_HITS_SUMMARY = True
 
-# Manual overrides: CoinGecko symbol → list of Coinalyze perps
+# Manual overrides (still supported, but generally unnecessary with fallback)
 OVERRIDES = {}
 
 # Explicit mapping to avoid symbol collisions (base → CG ID)
@@ -41,8 +41,7 @@ BASE_TO_CGID = {
     "ftm": "fantom", "sui": "sui", "sei": "sei-network",
 }
 
-# Bases we consider stablecoins and will EXCLUDE from querying.
-# NOTE: WUSDT (wormhole) is intentionally NOT included here.
+# Treat these as stables and exclude; WUSDT (wormhole) is intentionally NOT here
 STABLE_BASES = {
     "usdt","usdc","usd","susd","gusd","tusd","dai","usde","usdp","usdd","usds","usdx"
 }
@@ -55,7 +54,7 @@ CG_RANGE   = "https://api.coingecko.com/api/v3/coins/{id}/market_chart/range"
 
 # -------- HTTP helpers --------
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "liq-alerts/debug-raw-hardened-v2"})
+SESSION.headers.update({"User-Agent": "liq-alerts/v3"})
 
 def _sleep_jitter(base: float):
     time.sleep(base + random.random() * 0.25)
@@ -92,7 +91,7 @@ def http_get_with_backoff(url, params=None, timeout=45):
                     block = 30.0
                 print(f"[WARN] 429 on {url}; blocking {block:.3f}s")
                 time.sleep(block + 0.25)
-                continue  # do NOT increment attempt; obey server backoff
+                continue  # do NOT increment attempt on 429; obey server backoff
             if 500 <= r.status_code < 600:
                 wait = min(2 * attempt, 30)
                 print(f"[WARN] {r.status_code} on {url} attempt {attempt}/{MAX_RETRIES}; retrying in {wait}s")
@@ -180,7 +179,7 @@ def get_coins_in_cap_band_sorted():
     return coins
 
 def get_market_cap_at_close(coin_id, ts_end):
-    # Query a small window around ts_end and pick the last point <= ts_end
+    # Pick the last market cap <= bar end
     frm = ts_end - 30 * 60
     to = ts_end + 1
     url = CG_RANGE.format(id=coin_id)
@@ -197,15 +196,26 @@ def get_market_cap_at_close(coin_id, ts_end):
 
 # -------- Coinalyze --------
 def group_perps_by_base():
-    # single call; no need to rate-gate
+    """
+    Prefer aggregated .A markets; if a base has no .A, fall back to ALL per-exchange
+    perp symbols for that base (e.g., SOMIUSDT_PERP.BINANCE, .BYBIT, .OKX...).
+    """
     markets = coinalyze_get("/future-markets", {})
-    groups = {}
+    agg_by_base = {}
+    per_ex_by_base = {}
     for m in markets:
         sym = m.get("symbol", "")
         base = (m.get("base_asset") or "").lower()
-        # aggregated markets end with ".A"
-        if "_PERP" in sym and sym.endswith(".A"):
-            groups.setdefault(base, []).append(sym)
+        if "_PERP" not in sym:
+            continue
+        if sym.endswith(".A"):
+            agg_by_base.setdefault(base, []).append(sym)
+        else:
+            per_ex_by_base.setdefault(base, []).append(sym)
+
+    groups = {}
+    for b in set(agg_by_base) | set(per_ex_by_base):
+        groups[b] = agg_by_base.get(b) or per_ex_by_base.get(b, [])
     return groups
 
 def liq_last_hour_by_base(base_to_symbols):
@@ -236,7 +246,7 @@ def liq_last_hour_by_base(base_to_symbols):
             })
         except Exception as e:
             print(f"[ERROR] Coinalyze batch failed (size={len(chunk)}): {e}")
-            # Fallback: try splitting once into two sub-chunks
+            # Fallback: split once into two sub-chunks
             if len(chunk) > 1:
                 mid = len(chunk)//2
                 for sub in (chunk[:mid], chunk[mid:]):
@@ -310,7 +320,7 @@ def run_once():
 
     for coin in coins:
         base = (coin["symbol"] or "").lower()
-        if base in STABLE_BASES:  # skip stable bases
+        if base in STABLE_BASES:
             continue
         syms = base_to_symbols.get(base)
         if not syms:
