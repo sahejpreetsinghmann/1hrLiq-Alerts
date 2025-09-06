@@ -1,4 +1,4 @@
-# liq_alerts_v12_quoteaware_diag.py
+# liq_alerts_v13_quoteaware_diag_both.py
 import time, random, hashlib, requests, re
 from datetime import datetime, timedelta, timezone
 from collections import deque, defaultdict
@@ -33,15 +33,10 @@ MIN_LIQ_FOR_POSSIBLE_ALERT = RATIO_THRESHOLD * LOWER_CAP  # e.g., $10,000
 # Prefer aggregated markets when available (within each quote)
 PREFER_AGGREGATED = True
 
-# STRICT candle alignment: require t==frm?
-EXACT_BAR_REQUIRED = False  # set True if you want strict exact-bar only
+# STRICT candle alignment: require t==frm? If False, fallback to latest < to
+EXACT_BAR_REQUIRED = False
 
-# --- Optional: UI emulation filters for log comparison ---
-UI_EMU_QUOTES = None       # e.g., ["USDT"] or None for ALL
-UI_EMU_EXCHANGES = None    # e.g., ["BYBIT","BINANCE"] or None for ALL
-# ----------------------------------------------------------
-
-# Manual overrides
+# Manual overrides (base symbol -> list of Coinalyze symbols)
 OVERRIDES = {}
 
 # Explicit mapping to avoid symbol collisions (base → CG ID)
@@ -56,7 +51,7 @@ BASE_TO_CGID = {
     "ftm": "fantom", "sui": "sui", "sei": "sei-network",
 }
 
-# Stables to exclude (WUSDT intentionally NOT included)
+# Stables to exclude from base symbol list (WUSDT intentionally NOT included)
 STABLE_BASES = {"usdt","usdc","usd","susd","gusd","tusd","dai","usde","usdp","usdd","usds","usdx"}
 
 # -------- Endpoints --------
@@ -67,7 +62,7 @@ CG_RANGE   = "https://api.coingecko.com/api/v3/coins/{id}/market_chart/range"
 
 # -------- HTTP helpers --------
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "liq-alerts/v12-quoteaware"})
+SESSION.headers.update({"User-Agent": "liq-alerts/v13-quoteaware-both"})
 
 def _sleep_jitter(base: float):
     time.sleep(base + random.random() * 0.35)
@@ -317,7 +312,21 @@ def resolve_syms_for_coin_quoteaware(coin, agg, perex, markets):
 
     return None, "none"
 
-# -------- Liquidations fetch + accumulation --------
+# -------- Liquidations fetch + accumulation (production) --------
+def _select_candle(hist, frm, to):
+    target=None; latest_lt=None
+    for c in hist:
+        try:
+            t=int(c.get("t",0))
+        except:
+            continue
+        if t==frm:
+            return c
+        if t<to:
+            if (latest_lt is None) or (t>int(latest_lt.get("t",0))):
+                latest_lt=c
+    return target if EXACT_BAR_REQUIRED else latest_lt
+
 def liq_last_hour_by_base(base_to_symbols):
     frm,to=last_completed_hour_window()
     all_syms=sorted({s for syms in base_to_symbols.values() for s in syms})
@@ -326,16 +335,12 @@ def liq_last_hour_by_base(base_to_symbols):
     totals={b:0.0 for b in base_to_symbols}
     longs={b:0.0 for b in base_to_symbols}
     shorts={b:0.0 for b in base_to_symbols}
-
-    # Diagnostics
     raw_by_base={}
     per_symbol_breakdown=defaultdict(list)  # base -> list of {'symbol','quote','ex','l','s','t'}
-    by_quote=defaultdict(lambda: defaultdict(lambda: {"l":0.0,"s":0.0}))
-    by_exch =defaultdict(lambda: defaultdict(lambda: {"l":0.0,"s":0.0}))
 
     if not all_syms:
         print("[INFO] No symbols to query in Coinalyze.")
-        return totals,longs,shorts,raw_by_base,per_symbol_breakdown,by_quote,by_exch,frm,to
+        return totals,longs,shorts,raw_by_base,per_symbol_breakdown,frm,to
 
     CHUNK=COINALYZE_CHUNK
     for i in range(0,len(all_syms),CHUNK):
@@ -361,16 +366,16 @@ def liq_last_hour_by_base(base_to_symbols):
                             "from":frm,
                             "to":to-1,
                             "convert_to_usd":"true"})
-                        _accumulate_liqs(data_sub,symbol_to_base,raw_by_base,per_symbol_breakdown,by_quote,by_exch,totals,longs,shorts,frm,to)
+                        _accumulate_prod(data_sub,symbol_to_base,raw_by_base,per_symbol_breakdown,totals,longs,shorts,frm,to)
                     except Exception as e2:
                         print(f"[ERROR] Sub-chunk failed (size={len(sub)}): {e2}")
             continue
-        _accumulate_liqs(data,symbol_to_base,raw_by_base,per_symbol_breakdown,by_quote,by_exch,totals,longs,shorts,frm,to)
+        _accumulate_prod(data,symbol_to_base,raw_by_base,per_symbol_breakdown,totals,longs,shorts,frm,to)
         _sleep_jitter(PACE_SECONDS)
 
-    return totals,longs,shorts,raw_by_base,per_symbol_breakdown,by_quote,by_exch,frm,to
+    return totals,longs,shorts,raw_by_base,per_symbol_breakdown,frm,to
 
-def _accumulate_liqs(data,symbol_to_base,raw_by_base,per_symbol_breakdown,by_quote,by_exch,totals,longs,shorts,frm,to):
+def _accumulate_prod(data,symbol_to_base,raw_by_base,per_symbol_breakdown,totals,longs,shorts,frm,to):
     for entry in data:
         sym = entry.get("symbol")
         base_key=symbol_to_base.get(sym)
@@ -380,24 +385,10 @@ def _accumulate_liqs(data,symbol_to_base,raw_by_base,per_symbol_breakdown,by_quo
         if not hist:
             continue
 
-        # Choose candle
-        target=None; latest_lt=None
-        for c in hist:
-            try:
-                t=int(c.get("t",0))
-            except:
-                continue
-            if t==frm:
-                target=c; break
-            if t<to:
-                if (latest_lt is None) or (t>int(latest_lt.get("t",0))):
-                    latest_lt=c
-        if target is None and not EXACT_BAR_REQUIRED:
-            target = latest_lt
-
+        target = _select_candle(hist, frm, to)
         raw_by_base.setdefault(base_key,[]).extend(hist)
         if target is None:
-            print(f"[SKIP] {sym} has no suitable candle (exact={EXACT_BAR_REQUIRED}) at window; excluded")
+            print(f"[SKIP] {sym} has no suitable candle (exact={EXACT_BAR_REQUIRED}); excluded from totals")
             continue
 
         l=float(target.get("l",0)); s=float(target.get("s",0))
@@ -410,8 +401,108 @@ def _accumulate_liqs(data,symbol_to_base,raw_by_base,per_symbol_breakdown,by_quo
         per_symbol_breakdown[base_key].append({
             "symbol": sym, "quote": q, "ex": ex, "l": l, "s": s, "t": int(target.get("t",0))
         })
-        by_quote[base_key][q]["l"] += l; by_quote[base_key][q]["s"] += s
-        by_exch [base_key][ex]["l"] += l; by_exch [base_key][ex]["s"] += s
+
+# -------- Diagnostics: fetch full set (.A + per-ex) and log both --------
+def build_diag_symbol_set_for_base(base_raw, coin, agg, perex, markets):
+    """Return ALL candidate symbols for this base across quotes: both .A and per-exchange."""
+    keys = [norm(base_raw), norm(coin.get("name","")), norm(coin.get("id",""))]
+    by_q = defaultdict(lambda: {"agg": set(), "per": set()})
+    for k in keys:
+        if not k: continue
+        for q, lst in (agg.get(k) or {}).items():
+            by_q[q]["agg"].update(lst)
+        for q, lst in (perex.get(k) or {}).items():
+            by_q[q]["per"].update(lst)
+
+    # Rescue: regex in case maps missed something
+    base_up = base_raw.upper()
+    quote_alt = "|".join(_QUOTE_SUFFIXES)
+    rx = re.compile(rf"^{re.escape(base_up)}(?:{quote_alt}).*_PERP", re.IGNORECASE)
+    hits = [m.get("symbol") for m in markets if rx.match(m.get("symbol",""))]
+    for h in hits:
+        q = _quote_from_symbol(h)
+        if h.endswith(".A"): by_q[q]["agg"].add(h)
+        else: by_q[q]["per"].add(h)
+
+    # Convert to sorted lists
+    out = {}
+    for q,parts in by_q.items():
+        agg_list = sorted(parts["agg"])
+        per_list = sorted(parts["per"])
+        if agg_list or per_list:
+            out[q] = {"agg": agg_list, "per": per_list}
+    return out  # {quote: {"agg":[..], "per":[..]}}
+
+def fetch_liqs_for_symbols(symbols, frm, to):
+    """Return list of rows: {'symbol','l','s','t'} for the selected candle per symbol."""
+    rows = []
+    if not symbols: return rows
+    CHUNK = COINALYZE_CHUNK
+    for i in range(0, len(symbols), CHUNK):
+        chunk = symbols[i:i+CHUNK]
+        try:
+            _coinalyze_rate_gate()
+            data=coinalyze_get("/liquidation-history",{
+                "symbols":",".join(chunk),
+                "interval":"1hour",
+                "from":frm,
+                "to":to-1,
+                "convert_to_usd":"true"})
+        except Exception as e:
+            print(f"[ERROR] Coinalyze diag batch failed (size={len(chunk)}): {e}")
+            continue
+        for entry in data:
+            sym = entry.get("symbol")
+            hist = entry.get("history", [])
+            if not hist: continue
+            target = _select_candle(hist, frm, to)
+            if target is None:
+                print(f"[SKIP] DIAG {sym} has no suitable candle (exact={EXACT_BAR_REQUIRED})")
+                continue
+            rows.append({
+                "symbol": sym,
+                "l": float(target.get("l",0)),
+                "s": float(target.get("s",0)),
+                "t": int(target.get("t",0)),
+                "quote": _quote_from_symbol(sym),
+                "ex": _exchange_from_symbol(sym)
+            })
+        _sleep_jitter(PACE_SECONDS)
+    return rows
+
+def log_diag_for_base(base_raw, diag_map, frm, to):
+    """
+    diag_map is {quote: {"agg":[..], "per":[..]}}.
+    Logs per-quote: .A totals vs per-ex totals, plus per-exchange splits.
+    """
+    if not diag_map: 
+        print(f"[DIAG] {base_raw.upper()} no diag symbols found")
+        return
+
+    for q in sorted(diag_map.keys()):
+        agg_syms = diag_map[q].get("agg", [])
+        per_syms = diag_map[q].get("per", [])
+
+        agg_rows = fetch_liqs_for_symbols(agg_syms, frm, to) if agg_syms else []
+        per_rows = fetch_liqs_for_symbols(per_syms, frm, to) if per_syms else []
+
+        agg_L = sum(r["l"] for r in agg_rows); agg_S = sum(r["s"] for r in agg_rows)
+        per_L = sum(r["l"] for r in per_rows); per_S = sum(r["s"] for r in per_rows)
+
+        print(f"[DIAG] {base_raw.upper()} q={q}: "
+              f".A long={agg_L:.2f} short={agg_S:.2f} total={(agg_L+agg_S):.2f}  ||  "
+              f"PER-EX long={per_L:.2f} short={per_S:.2f} total={(per_L+per_S):.2f} "
+              f"diff={(agg_L+agg_S)-(per_L+per_S):.2f}")
+
+        # Per-exchange detail for PER-EX side (to match UI tabs)
+        if per_rows:
+            by_ex = defaultdict(lambda: {"l":0.0,"s":0.0})
+            for r in per_rows:
+                by_ex[r["ex"]]["l"] += r["l"]; by_ex[r["ex"]]["s"] += r["s"]
+            print(f"[DIAGX] {base_raw.upper()} q={q} per-exchange breakdown:")
+            for ex,vals in sorted(by_ex.items()):
+                tot = vals["l"] + vals["s"]
+                print(f"        ex={ex:<10} long={vals['l']:.2f} short={vals['s']:.2f} total={tot:.2f}")
 
 # -------- Main --------
 _seen_alerts=set()
@@ -419,7 +510,7 @@ _seen_alerts=set()
 def run_once():
     coins=get_coins_in_cap_band_sorted()
 
-    # Build quote-aware symbol maps
+    # Build quote-aware symbol maps and full markets list
     agg, perex, markets = group_perps_by_base_quote_both()
 
     base_to_symbols={}; unmatched=[]
@@ -439,7 +530,7 @@ def run_once():
         else:
             unmatched.append(f"{base_raw.upper()} ({coin['name']}) — no perps")
 
-    totals,longs,shorts,raw_by_base,per_symbol_breakdown,by_quote,by_exch,frm,to=liq_last_hour_by_base(base_to_symbols)
+    totals,longs,shorts,raw_by_base,per_symbol_breakdown,frm,to=liq_last_hour_by_base(base_to_symbols)
     checked=0; alerted=0
 
     print(f"[INFO] Window {frm}->{to} ({datetime.fromtimestamp(frm, timezone.utc)} – {datetime.fromtimestamp(to, timezone.utc)} UTC)")
@@ -450,66 +541,38 @@ def run_once():
         syms=base_to_symbols.get(base)
         if not syms: continue
 
-        # Production total (quote-aware selection)
         liq_usd=float(totals.get(base,0.0))
         liq_l=float(longs.get(base,0.0))
         liq_s=float(shorts.get(base,0.0))
         if liq_usd<MIN_LIQ_USD: continue
         checked+=1
 
-        # UI emulation (logs only)
-        ui_l=ui_s=0.0
-        if base in per_symbol_breakdown:
-            for row in per_symbol_breakdown[base]:
-                if UI_EMU_QUOTES and row["quote"] not in UI_EMU_QUOTES:
-                    continue
-                if UI_EMU_EXCHANGES and row["ex"] not in UI_EMU_EXCHANGES:
-                    continue
-                ui_l += row["l"]; ui_s += row["s"]
-        ui_total = ui_l + ui_s
-
         # Math-impossible check before CG /range
         if liq_usd < MIN_LIQ_FOR_POSSIBLE_ALERT:
             print(f"[DEBUG] {base_raw.upper()} skipped (liq < min for any alert) | liq={liq_usd:.2f} need>={MIN_LIQ_FOR_POSSIBLE_ALERT:.2f}")
+            # Still run diagnostics for visibility:
+            diag_map = build_diag_symbol_set_for_base(base_raw, coin, agg, perex, markets)
+            log_diag_for_base(base_raw, diag_map, frm, to)
             continue
 
         cg_id=BASE_TO_CGID.get(base,coin["id"])
         mc_close=get_market_cap_at_close(cg_id,to)
         if mc_close<=0 or not(LOWER_CAP<=mc_close<=UPPER_CAP):
             print(f"[DEBUG] {base_raw.upper()} dropped by historical MC band | mc_close={mc_close:.2f}")
+            # Diagnostics still useful
+            diag_map = build_diag_symbol_set_for_base(base_raw, coin, agg, perex, markets)
+            log_diag_for_base(base_raw, diag_map, frm, to)
             continue
 
         ratio=liq_usd/mc_close
 
-        # ----- LOGS: per-symbol + per-quote + per-exchange -----
-        br_list = per_symbol_breakdown.get(base, [])
-        if br_list:
-            # Determine mode per quote
-            q_modes = defaultdict(set)
-            for r in br_list:
-                q_modes[r['quote']].add('AGG' if r['ex']=='A' else 'PEREX')
-            modes = ", ".join(f"{q}:{'/'.join(sorted(q_modes[q]))}" for q in sorted(q_modes))
-            print(f"[BRK] {base_raw.upper()} symbols used ({modes}) for {datetime.fromtimestamp(frm, timezone.utc)}–{datetime.fromtimestamp(to, timezone.utc)} UTC:")
-            for br in sorted(br_list, key=lambda x: (x["quote"], x["ex"], x["symbol"])):
-                print(f"       {br['symbol']:<30} q={br['quote']:<5} ex={br['ex']:<8} long={br['l']:.2f} short={br['s']:.2f} total={br['l']+br['s']:.2f}")
-
-            if by_quote.get(base):
-                print(f"[SUMQ] {base_raw.upper()} by quote:")
-                for q,vals in by_quote[base].items():
-                    print(f"       {q:<5} long={vals['l']:.2f} short={vals['s']:.2f} total={(vals['l']+vals['s']):.2f}")
-
-            if by_exch.get(base):
-                print(f"[SUMX] {base_raw.upper()} by exchange:")
-                for ex,vals in by_exch[base].items():
-                    print(f"       {ex:<8} long={vals['l']:.2f} short={vals['s']:.2f} total={(vals['l']+vals['s']):.2f}")
-
-            if UI_EMU_QUOTES or UI_EMU_EXCHANGES:
-                print(f"[UIEMU] {base_raw.upper()} UI-emulated sum "
-                      f"(quotes={UI_EMU_QUOTES or 'ALL'}, exchanges={UI_EMU_EXCHANGES or 'ALL'}) "
-                      f"long={ui_l:.2f} short={ui_s:.2f} total={ui_total:.2f}")
-
+        # ----- Logs: production summary -----
         print(f"[DEBUG] {base_raw.upper()} | PROD liq={liq_usd:.2f} (L={liq_l:.2f} S={liq_s:.2f}) "
               f"| MC_close={mc_close:.2f} | Liq/MC={ratio*100:.4f}% | syms={syms}")
+
+        # ----- Diagnostics: show .A vs PER-EX and per-exchange splits -----
+        diag_map = build_diag_symbol_set_for_base(base_raw, coin, agg, perex, markets)
+        log_diag_for_base(base_raw, diag_map, frm, to)
 
         if ratio>=RATIO_THRESHOLD:
             key=idem_key(sorted(syms),frm,to,round(ratio,8))
