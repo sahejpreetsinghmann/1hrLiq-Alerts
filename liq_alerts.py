@@ -1,4 +1,4 @@
-# liq_alerts_v7.py
+# liq_alerts_v7_slow.py
 import time, random, hashlib, requests, re
 from datetime import datetime, timedelta, timezone
 from collections import deque
@@ -16,10 +16,10 @@ MIN_24H_VOL = 10_000_000
 RATIO_THRESHOLD = 0.0002   # 0.02%
 MIN_LIQ_USD = 0
 
-# Coinalyze pacing / limits
-COINALYZE_CHUNK = 8          # reduce to 5 if 429s persist
-PACE_SECONDS = 2.4
-COINALYZE_GLOBAL_RPM = 30
+# Coinalyze pacing / limits (SLOWED)
+COINALYZE_CHUNK = 5          # symbols per request (smaller batch)
+PACE_SECONDS = 3.5           # spacing between chunks (slower)
+COINALYZE_GLOBAL_RPM = 20    # global soft cap: max requests/minute
 
 COINGECKO_PACE_SECONDS = 1.8
 MAX_RETRIES = 7
@@ -54,7 +54,7 @@ CG_RANGE   = "https://api.coingecko.com/api/v3/coins/{id}/market_chart/range"
 
 # -------- HTTP helpers --------
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "liq-alerts/v7"})
+SESSION.headers.update({"User-Agent": "liq-alerts/v7-slow"})
 
 def _sleep_jitter(base: float):
     time.sleep(base + random.random() * 0.25)
@@ -253,7 +253,7 @@ def liq_last_hour_by_base(base_to_symbols):
                 "symbols":",".join(chunk),
                 "interval":"1hour",
                 "from":frm,
-                "to":to-1,                 # <-- end exclusive to avoid next hour
+                "to":to-1,                 # end exclusive to avoid next hour
                 "convert_to_usd":"true"})
         except Exception as e:
             print(f"[ERROR] Coinalyze batch failed (size={len(chunk)}): {e}")
@@ -266,7 +266,7 @@ def liq_last_hour_by_base(base_to_symbols):
                             "symbols":",".join(sub),
                             "interval":"1hour",
                             "from":frm,
-                            "to":to-1,       # <-- also exclusive here
+                            "to":to-1,
                             "convert_to_usd":"true"})
                         _accumulate_liqs(data_sub,symbol_to_base,raw_by_base,totals,frm,to)
                     except Exception as e2:
